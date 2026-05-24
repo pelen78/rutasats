@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATS — Editor de Rutas</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: #1a1a1a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px 12px;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    color: #eee;
+    height: 100vh;
+  }
+  h2 { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+
+  /* ── toolbar ── */
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-bottom: 5px;
+    align-items: center;
+    justify-content: center;
+  }
+  .toolbar button {
+    padding: 5px 13px;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    transition: transform .1s, opacity .15s, box-shadow .15s;
+  }
+  .toolbar button:hover  { opacity:.88; transform:scale(1.03); }
+  .toolbar button:active { transform:scale(.97); }
+  .toolbar button.active { box-shadow: 0 0 0 3px rgba(255,255,255,.55); }
+
+  #btnRed   { background:#e53935; color:#fff; }
+  #btnBlue  { background:#1565c0; color:#fff; }
+  #btnPlay  { background: linear-gradient(135deg,#43a047,#1b5e20); color:#fff; }
+  #btnUndo  { background:#555; color:#ddd; }
+  #btnClearR{ background:#7b1919; color:#fdd; }
+  #btnClearB{ background:#0d2e5c; color:#cdf; }
+  #btnReset { background:#333; color:#aaa; }
+
+  .sep { width:1px; height:22px; background:#444; margin:0 3px; }
+
+  /* ── step hints ── */
+  .hint {
+    font-size: 11.5px;
+    color: #aaa;
+    margin-bottom: 4px;
+    text-align: center;
+    min-height: 16px;
+  }
+  .hint b { color:#fff; }
+
+  /* ── map canvas ── */
+  .map-wrap {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 6px 30px rgba(0,0,0,.8);
+    cursor: crosshair;
+    flex-shrink: 1;
+    /* Fill remaining vertical space, respecting aspect ratio */
+    max-height: calc(100vh - 130px);
+  }
+  #mapImg {
+    display: block;
+    max-width: min(1286px, 95vw);
+    max-height: calc(100vh - 130px);
+    width: auto;
+    height: auto;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  #overlay {
+    position: absolute;
+    top:0; left:0;
+    width:100%; height:100%;
+  }
+
+  /* ── status bar ── */
+  .statusbar {
+    margin-top: 5px;
+    font-size: 11px;
+    color: #888;
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .statusbar span { display:flex; align-items:center; gap:5px; }
+  .dot { width:9px; height:9px; border-radius:50%; }
+</style>
+</head>
+<body>
+
+<h2>The American School of Tampico — Editor de Rutas</h2>
+
+<div class="toolbar">
+  <button id="btnRed">🔴 Trazar Rojo</button>
+  <button id="btnBlue">🔵 Trazar Azul</button>
+  <div class="sep"></div>
+  <button id="btnUndo">↩ Deshacer</button>
+  <button id="btnClearR">✕ Borrar Rojo</button>
+  <button id="btnClearB">✕ Borrar Azul</button>
+  <div class="sep"></div>
+  <button id="btnPlay">▶ Animar</button>
+  <button id="btnReset">⏹ Detener</button>
+</div>
+
+<div class="hint" id="hintMsg">
+  Presiona <b>Trazar Rojo</b> y haz clic sobre la línea roja del mapa.
+</div>
+
+<div class="map-wrap">
+  <img id="mapImg"
+    src="/Users/pelen/Downloads/ruta.png"
+    alt="Mapa ATS" draggable="false" />
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="statusbar">
+  <span><div class="dot" style="background:#e53935"></div><span id="countRed">Rojo: 0 puntos</span></span>
+  <span><div class="dot" style="background:#1565c0"></div><span id="countBlue">Azul: 0 puntos</span></span>
+</div>
+
+
+<script>
+const img      = document.getElementById('mapImg');
+const canvas   = document.getElementById('overlay');
+const ctx      = canvas.getContext('2d');
+const hintEl   = document.getElementById('hintMsg');
+const countR   = document.getElementById('countRed');
+const countB   = document.getElementById('countBlue');
+
+const BASE_W = 1286;
+const BASE_H = 840;
+
+// Path storage (in image-native coordinates)
+let redPts  = [];
+let bluePts = [];
+
+// Modes: 'idle' | 'red' | 'blue' | 'play'
+let mode = 'idle';
+let animFrame = null;
+let startTime = null;
+
+// ── Canvas sizing ─────────────────────────────────────────────────────────────
+function syncCanvas() {
+  canvas.width  = img.offsetWidth;
+  canvas.height = img.offsetHeight;
+  redraw();
+}
+
+function toCanvas([nx, ny]) {
+  return [nx * canvas.width / BASE_W, ny * canvas.height / BASE_H];
+}
+
+function toNative(cx, cy) {
+  // canvas px → image-native px
+  return [cx * BASE_W / canvas.width, cy * BASE_H / canvas.height];
+}
+
+// ── Drawing ───────────────────────────────────────────────────────────────────
+const COLORS = { red: '#ef5350', blue: '#1e88e5' };
+
+function drawPath(pts, color, active) {
+  if (pts.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = active ? 4 : 2.5;
+  ctx.lineCap     = 'round';
+  ctx.lineJoin    = 'round';
+  ctx.globalAlpha = active ? 0.9 : 0.65;
+  ctx.setLineDash(active ? [] : [6, 3]);
+  ctx.beginPath();
+  const [sx, sy] = toCanvas(pts[0]);
+  ctx.moveTo(sx, sy);
+  pts.slice(1).forEach(p => {
+    const [x, y] = toCanvas(p);
+    ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Dots
+  ctx.globalAlpha = 1;
+  pts.forEach((p, i) => {
+    const [x, y] = toCanvas(p);
+    ctx.beginPath();
+    ctx.arc(x, y, i === 0 || i === pts.length-1 ? 6 : 3.5, 0, Math.PI*2);
+    ctx.fillStyle = i === 0 ? '#fff' : (i === pts.length-1 ? '#ffeb3b' : color);
+    ctx.fill();
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  ctx.restore();
+}
+
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawPath(redPts,  COLORS.red,  mode === 'red');
+  drawPath(bluePts, COLORS.blue, mode === 'blue');
+  countR.textContent = `Rojo: ${redPts.length} puntos`;
+  countB.textContent = `Azul: ${bluePts.length} puntos`;
+}
+
+// ── Pos on path ───────────────────────────────────────────────────────────────
+function posOnPath(pts, t) {
+  if (pts.length < 2) return null;
+  t = Math.max(0, Math.min(1, t));
+  const n  = pts.length - 1;
+  const gt = t * n;
+  const i  = Math.min(Math.floor(gt), n - 1);
+  const lt = gt - i;
+  const [x1, y1] = toCanvas(pts[i]);
+  const [x2, y2] = toCanvas(pts[i+1]);
+  return { x: x1+(x2-x1)*lt, y: y1+(y2-y1)*lt, angle: Math.atan2(y2-y1, x2-x1) };
+}
+
+// ── Car drawing ───────────────────────────────────────────────────────────────
+function drawCar(x, y, angle, body, roof) {
+  const s = canvas.width / BASE_W;
+  const W = 26*s, H = 15*s, R = 3*s;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.shadowColor   = 'rgba(0,0,0,.6)';
+  ctx.shadowBlur    = 8*s;
+  ctx.shadowOffsetY = 3*s;
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.roundRect(-W/2, -H/2, W, H, R);
+  ctx.fill();
+  ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  ctx.fillStyle = roof;
+  ctx.beginPath();
+  ctx.roundRect(-W*.08, -H*.42, W*.48, H*.84, R*.5);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.2)';
+  ctx.beginPath();
+  ctx.roundRect(-W*.04, -H*.34, W*.18, H*.68, R*.3);
+  ctx.fill();
+  // headlights
+  ctx.fillStyle = '#fffde7';
+  ctx.beginPath(); ctx.arc( W/2-3*s, -H*.28, 2*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc( W/2-3*s,  H*.28, 2*s, 0, Math.PI*2); ctx.fill();
+  // taillights
+  ctx.fillStyle = '#ff8a80';
+  ctx.beginPath(); ctx.arc(-W/2+3*s, -H*.28, 2*s, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(-W/2+3*s,  H*.28, 2*s, 0, Math.PI*2); ctx.fill();
+  // wheels
+  ctx.fillStyle = '#111';
+  [[-W*.27,-H*.5],[W*.18,-H*.5],[-W*.27,H*.5],[W*.18,H*.5]].forEach(([wx,wy])=>{
+    ctx.beginPath(); ctx.ellipse(wx,wy,4*s,2.5*s,0,0,Math.PI*2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+// ── Animation ─────────────────────────────────────────────────────────────────
+const T_RED  = 11000;
+const T_BLUE =  6000;
+
+function animFrame_fn(ts) {
+  if (!startTime) startTime = ts;
+  const el = ts - startTime;
+
+  syncCanvas(); // also calls redraw() which draws paths
+
+  const tR = Math.min(el / T_RED,  1);
+  const tB = Math.min(el / T_BLUE, 1);
+
+  if (redPts.length >= 2) {
+    const rp = posOnPath(redPts, tR);
+    if (rp) drawCar(rp.x, rp.y, rp.angle, '#e53935', '#b71c1c');
+  }
+  if (bluePts.length >= 2) {
+    const bp = posOnPath(bluePts, tB);
+    if (bp) drawCar(bp.x, bp.y, bp.angle, '#1565c0', '#0d47a1');
+  }
+
+  if (el < Math.max(
+      redPts.length  >= 2 ? T_RED  : 0,
+      bluePts.length >= 2 ? T_BLUE : 0)) {
+    animFrame = requestAnimationFrame(animFrame_fn);
+  } else {
+    hintEl.innerHTML = '✅ Animación completa — presiona <b>▶ Animar</b> para repetir.';
+    animFrame = null;
+    mode = 'idle';
+  }
+}
+
+function stopAnim() {
+  if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+  startTime = null;
+}
+
+// ── Click handler ─────────────────────────────────────────────────────────────
+canvas.addEventListener('click', e => {
+  if (mode !== 'red' && mode !== 'blue') return;
+  const rect = canvas.getBoundingClientRect();
+  const cx   = e.clientX - rect.left;
+  const cy   = e.clientY - rect.top;
+  const [nx, ny] = toNative(cx, cy);
+  if (mode === 'red')  { redPts.push([nx, ny]);  }
+  if (mode === 'blue') { bluePts.push([nx, ny]); }
+  redraw();
+});
+
+// ── Buttons ───────────────────────────────────────────────────────────────────
+function setMode(m) {
+  stopAnim();
+  mode = m;
+  document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+  if (m === 'red')  {
+    document.getElementById('btnRed').classList.add('active');
+    hintEl.innerHTML = '🔴 Modo rojo activo — haz clic sobre la línea roja. Empieza en el <b>1</b>, termina en el <b>2</b>.';
+  }
+  if (m === 'blue') {
+    document.getElementById('btnBlue').classList.add('active');
+    hintEl.innerHTML = '🔵 Modo azul activo — haz clic sobre la línea azul. Empieza en el <b>1</b>, termina en el <b>2</b>.';
+  }
+}
+
+document.getElementById('btnRed').addEventListener('click',   () => setMode('red'));
+document.getElementById('btnBlue').addEventListener('click',  () => setMode('blue'));
+
+document.getElementById('btnUndo').addEventListener('click', () => {
+  stopAnim();
+  if (mode === 'red'  && redPts.length)  redPts.pop();
+  if (mode === 'blue' && bluePts.length) bluePts.pop();
+  redraw();
+});
+
+document.getElementById('btnClearR').addEventListener('click', () => {
+  stopAnim(); redPts = []; redraw();
+  if (mode === 'red') setMode('red');
+});
+document.getElementById('btnClearB').addEventListener('click', () => {
+  stopAnim(); bluePts = []; redraw();
+  if (mode === 'blue') setMode('blue');
+});
+
+document.getElementById('btnPlay').addEventListener('click', () => {
+  if (redPts.length < 2 && bluePts.length < 2) {
+    hintEl.innerHTML = '⚠️ Traza al menos una ruta antes de animar.';
+    return;
+  }
+  stopAnim();
+  mode = 'play';
+  document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+  document.getElementById('btnPlay').classList.add('active');
+  hintEl.innerHTML = '▶ Animando...';
+  animFrame = requestAnimationFrame(animFrame_fn);
+});
+
+document.getElementById('btnReset').addEventListener('click', () => {
+  stopAnim();
+  mode = 'idle';
+  document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+  hintEl.innerHTML = 'Presiona <b>Trazar Rojo</b> o <b>Trazar Azul</b> para continuar.';
+  redraw();
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+img.addEventListener('load', syncCanvas);
+if (img.complete) syncCanvas();
+window.addEventListener('resize', syncCanvas);
+</script>
+</body>
+</html>
